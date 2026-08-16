@@ -1,0 +1,232 @@
+'use client'
+
+import { useEffect, useState, useCallback } from 'react'
+import { useParams } from 'next/navigation'
+import { supabase, ensureAnonSession } from '../../../lib/supabase'
+import { balanceFor, activityFor, paidBy, shareOf, fmt, type EventRow } from '../../../lib/ledger'
+
+type Member = {
+  id: string
+  person_key: string
+  name: string
+  color_index: number
+  claimed: boolean
+  claimed_by_me: boolean
+}
+type GroupInfo = {
+  id: string
+  name: string
+  type: string
+  default_split: string
+  members: Member[]
+}
+
+const AVATAR = ['#12CF7A', '#2E8CFF', '#B45AF0', '#FFA114', '#FF375F', '#64D2FF']
+
+export default function JoinPage() {
+  const { token } = useParams<{ token: string }>()
+  const [group, setGroup] = useState<GroupInfo | null>(null)
+  const [events, setEvents] = useState<EventRow[]>([])
+  const [loading, setLoading] = useState(true)
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+
+  const me = group?.members.find((m) => m.claimed_by_me) ?? null
+
+  const loadGroup = useCallback(async () => {
+    const { data, error } = await supabase.rpc('get_group_by_token', { p_token: token })
+    if (error) { setError(error.message); return }
+    if (!data) { setError('This group link is invalid or was removed.'); return }
+    setGroup(data as GroupInfo)
+  }, [token])
+
+  const loadEvents = useCallback(async (groupId: string) => {
+    // RLS only lets a CLAIMED member read events, so this returns [] until claimed.
+    const { data } = await supabase
+      .from('events')
+      .select('kind, payload, created_at')
+      .eq('group_id', groupId)
+      .order('created_at', { ascending: true })
+    setEvents((data ?? []) as EventRow[])
+  }, [])
+
+  // Boot: anon session, then load group.
+  useEffect(() => {
+    let alive = true
+    ;(async () => {
+      try {
+        await ensureAnonSession()
+        await loadGroup()
+      } catch (e: any) {
+        if (alive) setError(e.message ?? 'Something went wrong.')
+      } finally {
+        if (alive) setLoading(false)
+      }
+    })()
+    return () => { alive = false }
+  }, [loadGroup])
+
+  // Once we know the group + claim, (re)load events and subscribe to realtime.
+  useEffect(() => {
+    if (!group) return
+    if (me) loadEvents(group.id)
+
+    const channel = supabase
+      .channel(`group-${group.id}`)
+      .on('postgres_changes',
+        { event: '*', schema: 'public', table: 'events', filter: `group_id=eq.${group.id}` },
+        () => { if (me) loadEvents(group.id) })
+      .on('postgres_changes',
+        { event: '*', schema: 'public', table: 'group_members', filter: `group_id=eq.${group.id}` },
+        () => { loadGroup() })
+      .subscribe()
+
+    return () => { supabase.removeChannel(channel) }
+  }, [group?.id, me?.person_key, loadEvents, loadGroup])
+
+  async function claim(person_key: string) {
+    setBusy(true); setError(null)
+    const { data, error } = await supabase.rpc('claim_member', { p_token: token, p_person_key: person_key })
+    setBusy(false)
+    if (error) { setError(error.message); return }
+    if (!data?.ok) {
+      setError(data?.error === 'slot_taken' ? 'Someone just took that name. Pick another.' : 'Could not claim that name.')
+    }
+    await loadGroup()
+  }
+
+  async function disconnect() {
+    if (!group) return
+    setBusy(true)
+    await supabase.rpc('release_member', { p_group_id: group.id })
+    setEvents([])
+    setBusy(false)
+    await loadGroup()
+  }
+
+  if (loading) return <Shell><p style={{ color: '#8E8E97' }}>Loading…</p></Shell>
+  if (error && !group) return <Shell><p style={{ color: '#FF4438' }}>{error}</p></Shell>
+  if (!group) return <Shell><p style={{ color: '#8E8E97' }}>Not found.</p></Shell>
+
+  return (
+    <Shell>
+      <div style={{ textAlign: 'center', marginBottom: 20 }}>
+        <div style={brand}>Kira<span style={{ color: '#12CF7A' }}>.</span></div>
+        <h1 style={{ fontSize: 24, fontWeight: 800, margin: '14px 0 4px' }}>{group.name}</h1>
+        <div style={{ color: '#8E8E97', fontSize: 13, textTransform: 'capitalize' }}>{group.type} group</div>
+      </div>
+
+      {error && <div style={errorBox}>{error}</div>}
+
+      {!me ? (
+        <>
+          <p style={{ color: '#B9B9C2', fontSize: 14, textAlign: 'center', marginBottom: 14 }}>
+            Who are you? Pick your name — it stays linked to you on this device.
+          </p>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+            {group.members.map((m) => (
+              <button
+                key={m.id}
+                disabled={m.claimed || busy}
+                onClick={() => claim(m.person_key)}
+                style={{ ...memberRow, opacity: m.claimed ? 0.45 : 1, cursor: m.claimed ? 'default' : 'pointer' }}
+              >
+                <Avatar name={m.name} idx={m.color_index} />
+                <span style={{ fontWeight: 600, flex: 1, textAlign: 'left' }}>{m.name}</span>
+                {m.claimed ? <span style={{ color: '#8E8E97', fontSize: 12, fontWeight: 700 }}>Taken</span>
+                           : <span style={{ color: '#8E8E97' }}>›</span>}
+              </button>
+            ))}
+          </div>
+        </>
+      ) : (
+        <MemberPanel group={group} me={me} events={events} onDisconnect={disconnect} busy={busy} />
+      )}
+    </Shell>
+  )
+}
+
+function MemberPanel({ group, me, events, onDisconnect, busy }:
+  { group: GroupInfo; me: Member; events: EventRow[]; onDisconnect: () => void; busy: boolean }) {
+  const bal = balanceFor(events, me.person_key)
+  const activity = activityFor(events, me.person_key)
+
+  return (
+    <>
+      <div style={{ ...card, display: 'flex', alignItems: 'center', gap: 11, marginBottom: 12 }}>
+        <Avatar name={me.name} idx={me.color_index} />
+        <div style={{ flex: 1 }}>
+          <div style={{ fontWeight: 700, fontSize: 14 }}>You&rsquo;re {me.name}</div>
+          <div style={{ color: '#8E8E97', fontSize: 11 }}>in {group.name}</div>
+        </div>
+        <button onClick={onDisconnect} disabled={busy}
+          style={{ background: 'none', border: 'none', color: '#FFA114', fontWeight: 600, fontSize: 12, cursor: 'pointer' }}>
+          Disconnect
+        </button>
+      </div>
+
+      <div style={{ ...card, marginBottom: 16 }}>
+        <div style={{ color: '#8E8E97', fontSize: 12 }}>
+          {bal > 0 ? 'You are owed' : bal < 0 ? 'You owe' : "You're settled up"}
+        </div>
+        <div style={{ fontSize: 28, fontWeight: 800, marginTop: 2,
+          color: bal > 0 ? '#12CF7A' : bal < 0 ? '#FFA114' : '#fff' }}>
+          {bal === 0 ? 'RM 0.00' : fmt(Math.abs(bal))}
+        </div>
+      </div>
+
+      <div style={{ color: '#8E8E97', fontSize: 11, fontWeight: 800, letterSpacing: 0.5, marginBottom: 8 }}>
+        YOUR ACTIVITY
+      </div>
+      {activity.length === 0 ? (
+        <p style={{ color: '#8E8E97', fontSize: 14 }}>You&rsquo;re not part of any expense here yet.</p>
+      ) : (
+        <div style={card}>
+          {activity.map((e, i) => (
+            <div key={e.id} style={{ display: 'flex', gap: 10, padding: '9px 0',
+              borderBottom: i < activity.length - 1 ? '1px solid #1C1C22' : 'none' }}>
+              <div style={{ flex: 1 }}>
+                <div style={{ fontSize: 13.5, fontWeight: 600 }}>{e.merchant}</div>
+                <div style={{ color: '#8E8E97', fontSize: 11 }}>
+                  {new Date(e.occurredAt).toLocaleString('en-MY', { day: 'numeric', month: 'short', hour: 'numeric', minute: '2-digit' })}
+                  {' · '}{paidBy(e, me.person_key) ? 'you paid' : 'your share'}
+                </div>
+              </div>
+              <div style={{ fontWeight: 700, fontSize: 13 }}>{fmt(shareOf(e, me.person_key) || 0)}</div>
+            </div>
+          ))}
+        </div>
+      )}
+    </>
+  )
+}
+
+// ---- presentational bits ----
+
+function Shell({ children }: { children: React.ReactNode }) {
+  return (
+    <main style={{ minHeight: '100dvh', background: '#0A0A0C', color: '#F5F5F7',
+      fontFamily: 'system-ui, -apple-system, Segoe UI, Roboto, sans-serif',
+      padding: '32px 18px', display: 'flex', justifyContent: 'center' }}>
+      <div style={{ width: '100%', maxWidth: 420 }}>{children}</div>
+    </main>
+  )
+}
+
+function Avatar({ name, idx }: { name: string; idx: number }) {
+  return (
+    <div style={{ width: 34, height: 34, borderRadius: '50%',
+      background: AVATAR[idx % AVATAR.length], color: '#0A0A0C',
+      display: 'flex', alignItems: 'center', justifyContent: 'center',
+      fontWeight: 800, fontSize: 14, flexShrink: 0 }}>
+      {(name[0] ?? '?').toUpperCase()}
+    </div>
+  )
+}
+
+const brand: React.CSSProperties = { fontSize: 26, fontWeight: 800, letterSpacing: -1 }
+const card: React.CSSProperties = { background: '#141419', borderRadius: 15, padding: 14 }
+const memberRow: React.CSSProperties = { display: 'flex', alignItems: 'center', gap: 11,
+  background: '#141419', border: 'none', borderRadius: 13, padding: 14, color: '#F5F5F7', width: '100%' }
+const errorBox: React.CSSProperties = { background: 'rgba(255,68,56,.1)', border: '1px solid rgba(255,68,56,.3)',
+  color: '#FF4438', borderRadius: 11, padding: '10px 12px', fontSize: 13, marginBottom: 12 }
