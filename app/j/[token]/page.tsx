@@ -121,7 +121,7 @@ export default function JoinPage() {
       {!me ? (
         <>
           <p style={{ color: '#B9B9C2', fontSize: 14, textAlign: 'center', marginBottom: 14 }}>
-            Who are you? Pick your name — it stays linked to you on this device.
+            Who are you? Pick your name. it stays linked to you on this device.
           </p>
           <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
             {group.members.map((m) => (
