@@ -1,12 +1,9 @@
 // Read-only ledger math for the web. Mirrors KiraLedger's balance derivation.
-// The web never CREATES splits (the app does that and already allocated every
-// sen), so we only REPLAY events and sum — no allocation logic here.
 //
-// Event payload contract (what the app's SyncClient pushes, and what the seed
-// SQL inserts):
+// Event payload contract:
 //   created / amended : { id, merchant, occurredAt, category?, payers:[{person,sen}], beneficiaries:[{person,sen}] }
 //   voided            : { id }
-//   settled           : { from, to, sen }
+//   settled           : { from, to, sen, expenseId? }   ← expenseId ties a settle to one activity
 
 export type Alloc = { person: string; sen: number }
 export type Expense = {
@@ -21,7 +18,7 @@ export type EventRow = { kind: string; payload: any }
 
 function replay(events: EventRow[]) {
   const live: Record<string, Expense> = {}
-  const settlements: { from: string; to: string; sen: number }[] = []
+  const settlements: { from: string; to: string; sen: number; expenseId?: string }[] = []
   for (const e of events) {
     if (e.kind === 'created' || e.kind === 'amended') live[e.payload.id] = e.payload
     else if (e.kind === 'voided') delete live[e.payload.id]
@@ -63,6 +60,22 @@ export function paidBy(e: Expense, person: string): boolean {
 
 export function shareOf(e: Expense, person: string): number {
   return e.beneficiaries.find((b) => b.person === person)?.sen ?? 0
+}
+
+// Does this person still owe on this expense? (has a share, didn't pay it)
+export function owesOn(e: Expense, person: string): boolean {
+  return !paidBy(e, person) && shareOf(e, person) > 0
+}
+
+// The set of expense ids this person has already settled.
+export function settledExpenseIds(events: EventRow[], person: string): Set<string> {
+  const out = new Set<string>()
+  for (const ev of events) {
+    if (ev.kind === 'settled' && ev.payload?.from === person && ev.payload?.expenseId) {
+      out.add(ev.payload.expenseId)
+    }
+  }
+  return out
 }
 
 export function fmt(sen: number): string {

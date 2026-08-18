@@ -3,7 +3,10 @@
 import { useEffect, useState, useCallback } from 'react'
 import { useParams } from 'next/navigation'
 import { supabase, ensureAnonSession } from '../../../lib/supabase'
-import { balanceFor, activityFor, paidBy, shareOf, fmt, type EventRow } from '../../../lib/ledger'
+import {
+  balanceFor, activityFor, paidBy, shareOf, owesOn, settledExpenseIds, fmt,
+  type EventRow, type Expense,
+} from '../../../lib/ledger'
 
 type Member = {
   id: string
@@ -29,6 +32,7 @@ export default function JoinPage() {
   const [events, setEvents] = useState<EventRow[]>([])
   const [loading, setLoading] = useState(true)
   const [busy, setBusy] = useState(false)
+  const [settling, setSettling] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
 
   const me = group?.members.find((m) => m.claimed_by_me) ?? null
@@ -41,7 +45,6 @@ export default function JoinPage() {
   }, [token])
 
   const loadEvents = useCallback(async (groupId: string) => {
-    // RLS only lets a CLAIMED member read events, so this returns [] until claimed.
     const { data } = await supabase
       .from('events')
       .select('kind, payload, created_at')
@@ -50,7 +53,6 @@ export default function JoinPage() {
     setEvents((data ?? []) as EventRow[])
   }, [])
 
-  // Boot: anon session, then load group.
   useEffect(() => {
     let alive = true
     ;(async () => {
@@ -66,7 +68,6 @@ export default function JoinPage() {
     return () => { alive = false }
   }, [loadGroup])
 
-  // Once we know the group + claim, (re)load events and subscribe to realtime.
   useEffect(() => {
     if (!group) return
     if (me) loadEvents(group.id)
@@ -104,6 +105,22 @@ export default function JoinPage() {
     await loadGroup()
   }
 
+  // Settle one activity: record that `me` paid their share to the expense's payer.
+  async function settleExpense(e: Expense) {
+    if (!group || !me) return
+    const payer = e.payers[0]?.person
+    if (!payer) return
+    setSettling(e.id); setError(null)
+    const { error } = await supabase.from('events').insert({
+      group_id: group.id,
+      kind: 'settled',
+      payload: { from: me.person_key, to: payer, sen: shareOf(e, me.person_key), expenseId: e.id },
+    })
+    setSettling(null)
+    if (error) { setError(error.message); return }
+    await loadEvents(group.id)   // realtime also refreshes, this makes it instant
+  }
+
   if (loading) return <Shell><p style={{ color: '#8E8E97' }}>Loading…</p></Shell>
   if (error && !group) return <Shell><p style={{ color: '#FF4438' }}>{error}</p></Shell>
   if (!group) return <Shell><p style={{ color: '#8E8E97' }}>Not found.</p></Shell>
@@ -121,7 +138,7 @@ export default function JoinPage() {
       {!me ? (
         <>
           <p style={{ color: '#B9B9C2', fontSize: 14, textAlign: 'center', marginBottom: 14 }}>
-            Who are you? Pick your name. it stays linked to you on this device.
+            Who are you? Pick your name — it stays linked to you on this device.
           </p>
           <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
             {group.members.map((m) => (
@@ -140,16 +157,22 @@ export default function JoinPage() {
           </div>
         </>
       ) : (
-        <MemberPanel group={group} me={me} events={events} onDisconnect={disconnect} busy={busy} />
+        <MemberPanel
+          group={group} me={me} events={events}
+          onDisconnect={disconnect} busy={busy}
+          onSettle={settleExpense} settling={settling}
+        />
       )}
     </Shell>
   )
 }
 
-function MemberPanel({ group, me, events, onDisconnect, busy }:
-  { group: GroupInfo; me: Member; events: EventRow[]; onDisconnect: () => void; busy: boolean }) {
+function MemberPanel({ group, me, events, onDisconnect, busy, onSettle, settling }:
+  { group: GroupInfo; me: Member; events: EventRow[]; onDisconnect: () => void; busy: boolean;
+    onSettle: (e: Expense) => void; settling: string | null }) {
   const bal = balanceFor(events, me.person_key)
   const activity = activityFor(events, me.person_key)
+  const settled = settledExpenseIds(events, me.person_key)
 
   return (
     <>
@@ -167,7 +190,7 @@ function MemberPanel({ group, me, events, onDisconnect, busy }:
 
       <div style={{ ...card, marginBottom: 16 }}>
         <div style={{ color: '#8E8E97', fontSize: 12 }}>
-          {bal > 0 ? 'You are owed' : bal < 0 ? 'You owe' : "You're settled up"}
+          {bal > 0 ? 'You are owed' : bal < 0 ? 'You owe' : "You're all settled up"}
         </div>
         <div style={{ fontSize: 28, fontWeight: 800, marginTop: 2,
           color: bal > 0 ? '#12CF7A' : bal < 0 ? '#FFA114' : '#fff' }}>
@@ -182,19 +205,42 @@ function MemberPanel({ group, me, events, onDisconnect, busy }:
         <p style={{ color: '#8E8E97', fontSize: 14 }}>You&rsquo;re not part of any expense here yet.</p>
       ) : (
         <div style={card}>
-          {activity.map((e, i) => (
-            <div key={e.id} style={{ display: 'flex', gap: 10, padding: '9px 0',
-              borderBottom: i < activity.length - 1 ? '1px solid #1C1C22' : 'none' }}>
-              <div style={{ flex: 1 }}>
-                <div style={{ fontSize: 13.5, fontWeight: 600 }}>{e.merchant}</div>
-                <div style={{ color: '#8E8E97', fontSize: 11 }}>
-                  {new Date(e.occurredAt).toLocaleString('en-MY', { day: 'numeric', month: 'short', hour: 'numeric', minute: '2-digit' })}
-                  {' · '}{paidBy(e, me.person_key) ? 'you paid' : 'your share'}
+          {activity.map((e, i) => {
+            const share = shareOf(e, me.person_key)
+            const iOwe = owesOn(e, me.person_key)
+            const isSettled = settled.has(e.id)
+            return (
+              <div key={e.id} style={{ display: 'flex', gap: 10, alignItems: 'center', padding: '11px 0',
+                borderBottom: i < activity.length - 1 ? '1px solid #1C1C22' : 'none' }}>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ fontSize: 13.5, fontWeight: 600 }}>{e.merchant}</div>
+                  <div style={{ color: '#8E8E97', fontSize: 11 }}>
+                    {new Date(e.occurredAt).toLocaleString('en-MY', { day: 'numeric', month: 'short', hour: 'numeric', minute: '2-digit' })}
+                    {' · '}{paidBy(e, me.person_key) ? 'you paid' : 'your share'}
+                  </div>
+                </div>
+
+                <div style={{ textAlign: 'right', flexShrink: 0 }}>
+                  <div style={{ fontWeight: 700, fontSize: 13,
+                    color: isSettled ? '#8E8E97' : '#F5F5F7',
+                    textDecoration: isSettled ? 'line-through' : 'none' }}>
+                    {fmt(share || 0)}
+                  </div>
+
+                  {/* Only expenses you owe on get a settle control. */}
+                  {iOwe && (
+                    isSettled ? (
+                      <span style={settledPill}>✓ Settled</span>
+                    ) : (
+                      <button onClick={() => onSettle(e)} disabled={settling === e.id} style={settleBtn}>
+                        {settling === e.id ? '…' : 'Settle up'}
+                      </button>
+                    )
+                  )}
                 </div>
               </div>
-              <div style={{ fontWeight: 700, fontSize: 13 }}>{fmt(shareOf(e, me.person_key) || 0)}</div>
-            </div>
-          ))}
+            )
+          })}
         </div>
       )}
     </>
@@ -230,3 +276,8 @@ const memberRow: React.CSSProperties = { display: 'flex', alignItems: 'center', 
   background: '#141419', border: 'none', borderRadius: 13, padding: 14, color: '#F5F5F7', width: '100%' }
 const errorBox: React.CSSProperties = { background: 'rgba(255,68,56,.1)', border: '1px solid rgba(255,68,56,.3)',
   color: '#FF4438', borderRadius: 11, padding: '10px 12px', fontSize: 13, marginBottom: 12 }
+const settleBtn: React.CSSProperties = { marginTop: 5, background: '#12CF7A', color: '#04231A',
+  border: 'none', borderRadius: 9, padding: '5px 12px', fontSize: 11.5, fontWeight: 800, cursor: 'pointer' }
+const settledPill: React.CSSProperties = { display: 'inline-block', marginTop: 5,
+  background: 'rgba(18,207,122,.16)', color: '#12CF7A', borderRadius: 9,
+  padding: '4px 10px', fontSize: 11, fontWeight: 800 }
