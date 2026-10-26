@@ -34,6 +34,8 @@ export default function JoinPage() {
   const [busy, setBusy] = useState(false)
   const [settling, setSettling] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const [adding, setAdding] = useState(false)
+  const [newName, setNewName] = useState('')
 
   const me = group?.members.find((m) => m.claimed_by_me) ?? null
 
@@ -96,6 +98,26 @@ export default function JoinPage() {
     await loadGroup()
   }
 
+  // "I'm not listed": add a brand-new member and claim it in one step.
+  async function addSelf() {
+    const name = newName.trim()
+    if (!name) return
+    setBusy(true); setError(null)
+    const { data, error } = await supabase.rpc('add_self_member', { p_token: token, p_name: name })
+    setBusy(false)
+    if (error) { setError(error.message); return }
+    if (!data?.ok) {
+      setError(
+        data?.error === 'name_taken' ? 'That name is already in the group. If it\u2019s you, pick it from the list.'
+        : data?.error === 'already_claimed' ? 'You\u2019ve already picked a name in this group.'
+        : 'Could not add you. Try again.'
+      )
+      return
+    }
+    setAdding(false); setNewName('')
+    await loadGroup()
+  }
+
   async function disconnect() {
     if (!group) return
     setBusy(true)
@@ -154,6 +176,38 @@ export default function JoinPage() {
                            : <span style={{ color: '#8E8E97' }}>›</span>}
               </button>
             ))}
+
+            {!adding ? (
+              <button onClick={() => setAdding(true)} disabled={busy} style={notListedBtn}>
+                <span style={{ fontWeight: 600 }}>I&rsquo;m not listed</span>
+                <span style={{ color: '#8E8E97', fontSize: 12 }}>Add me to the group</span>
+              </button>
+            ) : (
+              <form
+                onSubmit={(ev) => { ev.preventDefault(); addSelf() }}
+                style={{ ...card, display: 'flex', flexDirection: 'column', gap: 10 }}
+              >
+                <label htmlFor="new-name" style={{ fontSize: 13, fontWeight: 600 }}>Your name</label>
+                <input
+                  id="new-name" autoFocus value={newName} maxLength={60}
+                  onChange={(ev) => setNewName(ev.target.value)}
+                  placeholder="e.g. Aisha" autoComplete="given-name"
+                  style={nameInput}
+                />
+                <div style={{ display: 'flex', gap: 8 }}>
+                  <button type="button" onClick={() => { setAdding(false); setNewName('') }} style={cancelBtn}>
+                    Cancel
+                  </button>
+                  <button type="submit" disabled={busy || !newName.trim()}
+                    style={{ ...joinBtn, opacity: busy || !newName.trim() ? 0.5 : 1 }}>
+                    Join
+                  </button>
+                </div>
+                <div style={{ color: '#8E8E97', fontSize: 11.5 }}>
+                  The group owner will see you joined and can rename or merge you.
+                </div>
+              </form>
+            )}
           </div>
         </>
       ) : (
@@ -281,3 +335,12 @@ const settleBtn: React.CSSProperties = { marginTop: 5, background: '#12CF7A', co
 const settledPill: React.CSSProperties = { display: 'inline-block', marginTop: 5,
   background: 'rgba(18,207,122,.16)', color: '#12CF7A', borderRadius: 9,
   padding: '4px 10px', fontSize: 11, fontWeight: 800 }
+const notListedBtn: React.CSSProperties = { display: 'flex', flexDirection: 'column', alignItems: 'flex-start', gap: 2,
+  background: 'transparent', border: '1px dashed rgba(46,140,255,.5)', borderRadius: 13, padding: 14,
+  color: '#F5F5F7', width: '100%', minHeight: 44, cursor: 'pointer', marginTop: 4 }
+const nameInput: React.CSSProperties = { background: '#0A0A0C', border: '1px solid #2A2A32', borderRadius: 10,
+  padding: '12px', color: '#F5F5F7', fontSize: 16, minHeight: 44 }
+const joinBtn: React.CSSProperties = { flex: 1, background: '#12CF7A', color: '#04231A', border: 'none',
+  borderRadius: 10, padding: '12px', fontWeight: 800, fontSize: 14, minHeight: 44, cursor: 'pointer' }
+const cancelBtn: React.CSSProperties = { flex: 1, background: '#1C1C22', color: '#F5F5F7', border: 'none',
+  borderRadius: 10, padding: '12px', fontWeight: 600, fontSize: 14, minHeight: 44, cursor: 'pointer' }
