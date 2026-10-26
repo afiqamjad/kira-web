@@ -4,7 +4,7 @@ import { useEffect, useState, useCallback } from 'react'
 import { useParams } from 'next/navigation'
 import { supabase, ensureAnonSession } from '../../../lib/supabase'
 import {
-  balanceFor, activityFor, paidBy, shareOf, owesOn, settledExpenseIds, fmt,
+  balanceFor, activityFor, paidBy, shareOf, settleStatus, fmt,
   type EventRow, type Expense,
 } from '../../../lib/ledger'
 
@@ -127,16 +127,17 @@ export default function JoinPage() {
     await loadGroup()
   }
 
-  // Settle one activity: record that `me` paid their share to the expense's payer.
-  async function settleExpense(e: Expense) {
+  // Settle one activity: record that `me` paid what's left of their share to the
+  // expense's payer. `amount` is the REMAINING part, so nothing is paid twice.
+  async function settleExpense(e: Expense, amount: number) {
     if (!group || !me) return
     const payer = e.payers[0]?.person
-    if (!payer) return
+    if (!payer || amount <= 0) return
     setSettling(e.id); setError(null)
     const { error } = await supabase.from('events').insert({
       group_id: group.id,
       kind: 'settled',
-      payload: { from: me.person_key, to: payer, sen: shareOf(e, me.person_key), expenseId: e.id },
+      payload: { from: me.person_key, to: payer, sen: amount, expenseId: e.id },
     })
     setSettling(null)
     if (error) { setError(error.message); return }
@@ -223,10 +224,10 @@ export default function JoinPage() {
 
 function MemberPanel({ group, me, events, onDisconnect, busy, onSettle, settling }:
   { group: GroupInfo; me: Member; events: EventRow[]; onDisconnect: () => void; busy: boolean;
-    onSettle: (e: Expense) => void; settling: string | null }) {
+    onSettle: (e: Expense, amount: number) => void; settling: string | null }) {
   const bal = balanceFor(events, me.person_key)
   const activity = activityFor(events, me.person_key)
-  const settled = settledExpenseIds(events, me.person_key)
+  const status = settleStatus(events, me.person_key)
 
   return (
     <>
@@ -261,8 +262,10 @@ function MemberPanel({ group, me, events, onDisconnect, busy, onSettle, settling
         <div style={card}>
           {activity.map((e, i) => {
             const share = shareOf(e, me.person_key)
-            const iOwe = owesOn(e, me.person_key)
-            const isSettled = settled.has(e.id)
+            const st = status.get(e.id)            // only set for expenses this person owes on
+            const iOwe = !!st
+            const isSettled = !!st && st.remaining <= 0
+            const partly = !!st && st.covered > 0 && st.remaining > 0
             return (
               <div key={e.id} style={{ display: 'flex', gap: 10, alignItems: 'center', padding: '11px 0',
                 borderBottom: i < activity.length - 1 ? '1px solid #1C1C22' : 'none' }}>
@@ -286,9 +289,16 @@ function MemberPanel({ group, me, events, onDisconnect, busy, onSettle, settling
                     isSettled ? (
                       <span style={settledPill}>✓ Settled</span>
                     ) : (
-                      <button onClick={() => onSettle(e)} disabled={settling === e.id} style={settleBtn}>
-                        {settling === e.id ? '…' : 'Settle up'}
-                      </button>
+                      <>
+                        {partly && (
+                          <div style={{ color: '#FFA114', fontSize: 11, fontWeight: 700, marginTop: 3 }}>
+                            {fmt(st!.remaining)} left
+                          </div>
+                        )}
+                        <button onClick={() => onSettle(e, st!.remaining)} disabled={settling === e.id} style={settleBtn}>
+                          {settling === e.id ? '…' : partly ? `Settle ${fmt(st!.remaining)}` : 'Settle up'}
+                        </button>
+                      </>
                     )
                   )}
                 </div>
