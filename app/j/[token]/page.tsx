@@ -4,8 +4,8 @@ import { useEffect, useState, useCallback } from 'react'
 import { useParams } from 'next/navigation'
 import { supabase, ensureAnonSession } from '../../../lib/supabase'
 import {
-  balanceFor, activityFor, paidBy, shareOf, settleStatus, fmt,
-  type EventRow, type Expense,
+  balanceFor, activityFor, paidBy, shareOf, transfersFor, fmt,
+  type EventRow, type Transfer, type SettleMode,
 } from '../../../lib/ledger'
 
 type Member = {
@@ -33,6 +33,7 @@ export default function JoinPage() {
   const [loading, setLoading] = useState(true)
   const [busy, setBusy] = useState(false)
   const [settling, setSettling] = useState<string | null>(null)
+  const [view, setView] = useState<'home' | 'settle'>('home')
   const [error, setError] = useState<string | null>(null)
   const [adding, setAdding] = useState(false)
   const [newName, setNewName] = useState('')
@@ -127,17 +128,17 @@ export default function JoinPage() {
     await loadGroup()
   }
 
-  // Settle one activity: record that `me` paid what's left of their share to the
-  // expense's payer. `amount` is the REMAINING part, so nothing is paid twice.
-  async function settleExpense(e: Expense, amount: number) {
-    if (!group || !me) return
-    const payer = e.payers[0]?.person
-    if (!payer || amount <= 0) return
-    setSettling(e.id); setError(null)
+  // Mark a settle-up transfer as paid (from the Settle up page). Works both
+  // ways: "I paid them" or "they paid me". The app picks it up like any other
+  // settle-up, so balances everywhere update.
+  async function markPaid(t: Transfer) {
+    if (!group || !me || t.sen <= 0) return
+    const key = `${t.from}>${t.to}`
+    setSettling(key); setError(null)
     const { error } = await supabase.from('events').insert({
       group_id: group.id,
       kind: 'settled',
-      payload: { from: me.person_key, to: payer, sen: amount, expenseId: e.id },
+      payload: { from: t.from, to: t.to, sen: t.sen, confirmedAt: new Date().toISOString() },
     })
     setSettling(null)
     if (error) { setError(error.message); return }
@@ -212,22 +213,29 @@ export default function JoinPage() {
           </div>
         </>
       ) : (
-        <MemberPanel
-          group={group} me={me} events={events}
-          onDisconnect={disconnect} busy={busy}
-          onSettle={settleExpense} settling={settling}
-        />
+        view === 'settle' ? (
+          <SettlePanel
+            group={group} me={me} events={events}
+            onBack={() => setView('home')}
+            onMarkPaid={markPaid} settling={settling}
+          />
+        ) : (
+          <MemberPanel
+            group={group} me={me} events={events}
+            onDisconnect={disconnect} busy={busy}
+            onOpenSettle={() => setView('settle')}
+          />
+        )
       )}
     </Shell>
   )
 }
 
-function MemberPanel({ group, me, events, onDisconnect, busy, onSettle, settling }:
+function MemberPanel({ group, me, events, onDisconnect, busy, onOpenSettle }:
   { group: GroupInfo; me: Member; events: EventRow[]; onDisconnect: () => void; busy: boolean;
-    onSettle: (e: Expense, amount: number) => void; settling: string | null }) {
+    onOpenSettle: () => void }) {
   const bal = balanceFor(events, me.person_key)
   const activity = activityFor(events, me.person_key)
-  const status = settleStatus(events, me.person_key)
 
   return (
     <>
@@ -251,6 +259,7 @@ function MemberPanel({ group, me, events, onDisconnect, busy, onSettle, settling
           color: bal > 0 ? '#12CF7A' : bal < 0 ? '#FFA114' : '#fff' }}>
           {bal === 0 ? 'RM 0.00' : fmt(Math.abs(bal))}
         </div>
+        <button onClick={onOpenSettle} style={settleUpBtn}>Settle up</button>
       </div>
 
       <div style={{ color: '#8E8E97', fontSize: 11, fontWeight: 800, letterSpacing: 0.5, marginBottom: 8 }}>
@@ -260,48 +269,95 @@ function MemberPanel({ group, me, events, onDisconnect, busy, onSettle, settling
         <p style={{ color: '#8E8E97', fontSize: 14 }}>You&rsquo;re not part of any expense here yet.</p>
       ) : (
         <div style={card}>
-          {activity.map((e, i) => {
-            const share = shareOf(e, me.person_key)
-            const st = status.get(e.id)            // only set for expenses this person owes on
-            const iOwe = !!st
-            const isSettled = !!st && st.remaining <= 0
-            const partly = !!st && st.covered > 0 && st.remaining > 0
+          {activity.map((e, i) => (
+            <div key={e.id} style={{ display: 'flex', gap: 10, alignItems: 'center', padding: '11px 0',
+              borderBottom: i < activity.length - 1 ? '1px solid #1C1C22' : 'none' }}>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ fontSize: 13.5, fontWeight: 600 }}>{e.merchant}</div>
+                <div style={{ color: '#8E8E97', fontSize: 11 }}>
+                  {new Date(e.occurredAt).toLocaleString('en-MY', { day: 'numeric', month: 'short', hour: 'numeric', minute: '2-digit' })}
+                  {' · '}{paidBy(e, me.person_key) ? 'you paid' : 'your share'}
+                </div>
+              </div>
+              <div style={{ fontWeight: 700, fontSize: 13, flexShrink: 0 }}>
+                {fmt(shareOf(e, me.person_key) || 0)}
+              </div>
+            </div>
+                    ))}
+        </div>
+      )}
+    </>
+  )
+}
+
+// Settle up: Simplified or Direct, showing only transfers that involve you.
+const MODES: { key: SettleMode; label: string; note: string }[] = [
+  { key: 'simplified', label: 'Simplified',
+    note: 'Fewest transfers. Someone may pay a person they didn\u2019t share an expense with.' },
+  { key: 'direct', label: 'Direct', note: 'Each pair settles only what they owe each other.' },
+]
+
+function SettlePanel({ group, me, events, onBack, onMarkPaid, settling }:
+  { group: GroupInfo; me: Member; events: EventRow[]; onBack: () => void;
+    onMarkPaid: (t: Transfer) => void; settling: string | null }) {
+  const storageKey = `kira.settleMode.${group.id}`
+  const [mode, setMode] = useState<SettleMode>(() => {
+    try {
+      const saved = typeof window !== 'undefined' ? window.localStorage.getItem(storageKey) : null
+      return saved === 'direct' ? 'direct' : 'simplified'
+    } catch { return 'simplified' }
+  })
+  function choose(m: SettleMode) {
+    setMode(m)
+    try { window.localStorage.setItem(storageKey, m) } catch { /* private mode: just don't remember */ }
+  }
+
+  const name = (key: string) =>
+    key === me.person_key ? 'You' : group.members.find((m) => m.person_key === key)?.name ?? key
+  const transfers = transfersFor(events, mode, me.person_key)
+  const note = MODES.find((m) => m.key === mode)!.note
+
+  return (
+    <>
+      <button onClick={onBack} style={backBtn}>‹ Back</button>
+      <h2 style={{ fontSize: 20, fontWeight: 800, margin: '4px 0 12px' }}>Settle up</h2>
+
+      <div role="radiogroup" aria-label="Settle method" style={segment}>
+        {MODES.map((m) => (
+          <button key={m.key} role="radio" aria-checked={mode === m.key} onClick={() => choose(m.key)}
+            style={{ ...segmentBtn, ...(mode === m.key ? segmentOn : null) }}>
+            {m.label}
+          </button>
+        ))}
+      </div>
+      <p style={{ color: '#8E8E97', fontSize: 12, margin: '8px 2px 14px' }}>{note}</p>
+
+      {transfers.length === 0 ? (
+        <div style={{ ...card, display: 'flex', gap: 8, alignItems: 'center' }}>
+          <span style={{ color: '#12CF7A' }}>✓</span>
+          <span style={{ fontSize: 14 }}>Nothing to settle between you and anyone.</span>
+        </div>
+      ) : (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+          {transfers.map((t) => {
+            const key = `${t.from}>${t.to}`
+            const youPay = t.from === me.person_key
+            const other = youPay ? t.to : t.from
+            const otherMember = group.members.find((m) => m.person_key === other)
             return (
-              <div key={e.id} style={{ display: 'flex', gap: 10, alignItems: 'center', padding: '11px 0',
-                borderBottom: i < activity.length - 1 ? '1px solid #1C1C22' : 'none' }}>
+              <div key={`${mode}|${key}|${t.sen}`} style={{ ...card, display: 'flex', alignItems: 'center', gap: 11 }}>
+                <Avatar name={otherMember?.name ?? other} idx={otherMember?.color_index ?? 0} />
                 <div style={{ flex: 1, minWidth: 0 }}>
-                  <div style={{ fontSize: 13.5, fontWeight: 600 }}>{e.merchant}</div>
-                  <div style={{ color: '#8E8E97', fontSize: 11 }}>
-                    {new Date(e.occurredAt).toLocaleString('en-MY', { day: 'numeric', month: 'short', hour: 'numeric', minute: '2-digit' })}
-                    {' · '}{paidBy(e, me.person_key) ? 'you paid' : 'your share'}
+                  <div style={{ fontWeight: 600, fontSize: 14 }}>
+                    {youPay ? `You pay ${name(other)}` : `${name(other)} pays you`}
+                  </div>
+                  <div style={{ fontWeight: 800, fontSize: 13, color: youPay ? '#FFA114' : '#12CF7A' }}>
+                    {fmt(t.sen)}
                   </div>
                 </div>
-
-                <div style={{ textAlign: 'right', flexShrink: 0 }}>
-                  <div style={{ fontWeight: 700, fontSize: 13,
-                    color: isSettled ? '#8E8E97' : '#F5F5F7',
-                    textDecoration: isSettled ? 'line-through' : 'none' }}>
-                    {fmt(share || 0)}
-                  </div>
-
-                  {/* Only expenses you owe on get a settle control. */}
-                  {iOwe && (
-                    isSettled ? (
-                      <span style={settledPill}>✓ Settled</span>
-                    ) : (
-                      <>
-                        {partly && (
-                          <div style={{ color: '#FFA114', fontSize: 11, fontWeight: 700, marginTop: 3 }}>
-                            {fmt(st!.remaining)} left
-                          </div>
-                        )}
-                        <button onClick={() => onSettle(e, st!.remaining)} disabled={settling === e.id} style={settleBtn}>
-                          {settling === e.id ? '…' : partly ? `Settle ${fmt(st!.remaining)}` : 'Settle up'}
-                        </button>
-                      </>
-                    )
-                  )}
-                </div>
+                <button onClick={() => onMarkPaid(t)} disabled={settling === key} style={settleBtn}>
+                  {settling === key ? '…' : 'Mark paid'}
+                </button>
               </div>
             )
           })}
@@ -340,11 +396,16 @@ const memberRow: React.CSSProperties = { display: 'flex', alignItems: 'center', 
   background: '#141419', border: 'none', borderRadius: 13, padding: 14, color: '#F5F5F7', width: '100%' }
 const errorBox: React.CSSProperties = { background: 'rgba(255,68,56,.1)', border: '1px solid rgba(255,68,56,.3)',
   color: '#FF4438', borderRadius: 11, padding: '10px 12px', fontSize: 13, marginBottom: 12 }
-const settleBtn: React.CSSProperties = { marginTop: 5, background: '#12CF7A', color: '#04231A',
+const settleBtn: React.CSSProperties = { minHeight: 36, background: '#12CF7A', color: '#04231A',
   border: 'none', borderRadius: 9, padding: '5px 12px', fontSize: 11.5, fontWeight: 800, cursor: 'pointer' }
-const settledPill: React.CSSProperties = { display: 'inline-block', marginTop: 5,
-  background: 'rgba(18,207,122,.16)', color: '#12CF7A', borderRadius: 9,
-  padding: '4px 10px', fontSize: 11, fontWeight: 800 }
+const settleUpBtn: React.CSSProperties = { marginTop: 12, width: '100%', minHeight: 44, background: '#12CF7A',
+  color: '#04231A', border: 'none', borderRadius: 11, fontWeight: 800, fontSize: 14, cursor: 'pointer' }
+const backBtn: React.CSSProperties = { background: 'none', border: 'none', color: '#12CF7A', fontWeight: 700,
+  fontSize: 14, padding: '8px 0', minHeight: 44, cursor: 'pointer' }
+const segment: React.CSSProperties = { display: 'flex', background: '#141419', borderRadius: 11, padding: 3, gap: 3 }
+const segmentBtn: React.CSSProperties = { flex: 1, minHeight: 40, border: 'none', borderRadius: 9, background: 'transparent',
+  color: '#B9B9C2', fontWeight: 700, fontSize: 13.5, cursor: 'pointer' }
+const segmentOn: React.CSSProperties = { background: '#2A2A32', color: '#F5F5F7' }
 const notListedBtn: React.CSSProperties = { display: 'flex', flexDirection: 'column', alignItems: 'flex-start', gap: 2,
   background: 'transparent', border: '1px dashed rgba(46,140,255,.5)', borderRadius: 13, padding: 14,
   color: '#F5F5F7', width: '100%', minHeight: 44, cursor: 'pointer', marginTop: 4 }
